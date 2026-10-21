@@ -1,0 +1,6 @@
+{
+  "model": "big-pickle",
+  "messages": [{ "role": "user", "content": "Reply only OK." }],
+  "max_tokens": 256,
+  "stream": true
+}

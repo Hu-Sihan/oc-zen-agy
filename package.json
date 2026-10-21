@@ -1,0 +1,14 @@
+{
+  "name": "oc-zen-agy",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "description": "精简的 OpenCode Zen Chat Completions 转发服务",
+  "engines": { "node": ">=24.5.0" },
+  "scripts": {
+    "start": "node src/server.mjs serve",
+    "probe": "node src/server.mjs probe",
+    "test": "node --test",
+    "test:network": "node scripts/network-tests.mjs"
+  }
+}

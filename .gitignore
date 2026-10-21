@@ -1,0 +1,9 @@
+state/
+config.json
+*.log
+dist/
+logs/
+node_modules/
+.task-cache/
+.env
+.env.*
