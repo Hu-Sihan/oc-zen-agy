@@ -1,6 +1,6 @@
 {
   "name": "oc-zen-agy",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "description": "精简的 OpenCode Zen Chat Completions 转发服务",

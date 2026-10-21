@@ -51,7 +51,7 @@ export async function listen(server) {
 
 export async function close(server) {
   if (realNetwork) {
-    server.closeAllConnections();
+    server.closeAllConnections?.();
     await new Promise(accept => server.close(accept));
     return;
   }

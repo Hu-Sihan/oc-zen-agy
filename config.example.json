@@ -3,6 +3,7 @@
   "port": 9999,
   "concurrency": 4,
   "stateDir": "./state",
+  "socks5File": "",
   "requestTimeoutMs": 120000,
   "maxBodyBytes": 8388608
 }

@@ -48,6 +48,7 @@ npm run probe
   "port": 9999,
   "concurrency": 4,
   "stateDir": "./state",
+  "socks5File": "",
   "requestTimeoutMs": 120000,
   "maxBodyBytes": 8388608
 }
@@ -59,6 +60,7 @@ npm run probe
 | `port` | 所有监听地址共用的端口，默认 9999 |
 | `concurrency` | 整个进程同时处理的上游请求数，默认 4；设为 1 时串行转发 |
 | `stateDir` | 会话文件所在目录，相对于配置文件目录解析 |
+| `socks5File` | SOCKS5 号池文件路径，相对于配置文件目录解析；默认空字符串表示直连 |
 | `requestTimeoutMs` | 请求准备、排队、上游处理和响应的总超时，默认 120000 毫秒 |
 | `maxBodyBytes` | 请求体及 SSE 转 JSON 时的上游字节上限，默认 8388608，即 8 MiB；SSE 透传不整体缓存 |
 | `baseURL` | 可选，上游 Chat Completions 基地址，默认 `https://opencode.ai/inference/openai/v1` |
@@ -75,6 +77,42 @@ npm run probe
 | `ZEN_PROBE_MODEL` | `big-pickle` | `npm run probe` 使用的模型 |
 
 本地密钥不会作为上游密钥转发。程序不自动加载 `.env`，也不读取 `HTTP_PROXY` / `HTTPS_PROXY`。环境变量和 `x-zen-*` 响应头沿用现有名称。
+
+## SOCKS5 出口号池
+
+在 `config.json` 中设置 `"socks5File": "./state/socks5.txt"` 即可启用。号池在启动时读取一次，一行一条，支持以下格式：
+
+```text
+# Webshare 格式，密码可以包含冒号
+proxy1.example:1080:username:password
+socks5://username:password@proxy2.example:1080
+socks5h://proxy3.example:1080
+[2001:db8::1]:1080:username:password
+```
+
+无认证代理可写成 `host:port`。URL 中账号密码的特殊字符需使用百分号编码。空行、`#` 注释与 UTF-8 BOM 可忽略，重复条目按首次出现顺序合并。启用后文件不存在、为空或包含无效条目会导致启动失败。
+
+- 所有监听地址共用一个出口池。聊天和模型列表在 FIFO 出队时轮询可用代理，健康检查不占用代理。
+- 上游返回 **HTTP 429** 时，立即将当前代理标记为当天停用；该请求仍返回原始 429，不自动换号重试。已经发出的其他请求不会被中止。
+- 后续请求跳过停用代理；全部停用时返回 **503 `proxy_pool_exhausted`**，并用 `Retry-After` 指明距离下一个 UTC 00:00 的秒数，不回退直连。
+- 每天 **UTC 00:00** 恢复所有停用代理，与主机时区无关。通过请求出队或健康检查时检查 UTC 日期实现，不需要轮询定时器。
+- 停用状态仅保存在当前进程内存中，**重启服务也会清空停用状态**；号池文件不会被写回。修改文件需重启。
+- 只有上游 HTTP 429 会停用代理。SOCKS5 连接、认证、TLS 或其他 HTTP 状态错误不会停用账号，也不会重试该请求。
+
+SOCKS5 支持远端解析目标域名、用户名密码认证、IPv4/IPv6 目标以及 HTTPS 证书校验。每个代理请求建立独立隧道，不复用其他账号的连接；SOCKS5 协商与 TLS 握手同样计入 `requestTimeoutMs`。
+
+启用号池后，`/healthz` 增加 `proxyPool`：
+
+```json
+{
+  "total": 10,
+  "available": 8,
+  "disabled": 2,
+  "resetAt": "2026-10-22T00:00:00.000Z"
+}
+```
+
+状态与日志不公开代理地址、账号或密码。真实账号文件应放在已忽略的 `state/` 目录，不随源码分发。
 
 ## HTTP 接口
 
@@ -120,7 +158,7 @@ curl.exe -N http://127.0.0.1:9999/v1/chat/completions -H "Content-Type: applicat
 
 `src/profile.mjs` 固化 OpenCode 1.19.3 的客户端特征和 88 个工具定义。当 `tools` 与 `tool_choice` 都未提供时，加入固定工具及 `tool_choice: "none"`；客户端显式提供的工具策略和其他模型参数会保留。代理不执行工具。上游始终使用流式请求，默认请求 usage。
 
-没有自动重试、备用模型或多线路切换。上游非成功状态和正文透传；客户端断开或超时会取消上游请求并释放名额。真实上游能否继续接受当前固定请求组合，需要使用 `npm run probe` 验证。
+同一请求不会自动重试、改用备用模型或更换代理。上游非成功状态和正文透传；客户端断开或超时会取消上游请求并释放名额。真实上游能否继续接受当前固定请求组合，需要使用 `npm run probe` 验证。
 
 ## Ubuntu systemd
 
@@ -179,14 +217,18 @@ npm run test:network
 
 `npm test` 使用内存双工流及真实 Node HTTP 解析器，验证请求兼容、FIFO 调度、并发、超时、断开、停机、会话轮换、TLS 校验、模型透传和监听回滚。`test:network` 使用本机真实 HTTP/TLS 网络及模拟上游，不消耗真实模型额度；真实多网卡绑定和 Zen 推理需要在部署环境另行验证。
 
+SOCKS5 测试还覆盖文件解析、认证、IPv4/IPv6 CONNECT、远端 DNS、429 停用、全池耗尽、UTC 跨日恢复、握手取消及通过代理的 TLS/SSE。
+
 | 路径 | 用途 |
 |---|---|
 | `src/server.mjs` | 启动、停止及 probe 入口 |
 | `src/forwarder.mjs` | 请求处理、会话池、FIFO、并发、多地址监听 |
 | `src/profile.mjs` | 固定客户端特征及工具 Schema |
 | `src/sse.mjs` | SSE 转完整 JSON |
+| `src/socks5.mjs` | SOCKS5 CONNECT、认证、代理池轮换及 UTC 重置 |
 | `examples/chat.json` | 流式请求示例 |
 | `test/`、`support/` | 测试及内存传输工具；TLS 私钥仅为本机测试夹具 |
 | `state/sessions.txt` | 用户提供的会话文件，不提交到 Git |
+| `state/socks5.txt` | 可选的真实代理账号文件，不提交到 Git |
 
 本机 `config.json`、`state/`、环境变量文件、日志、缓存与 `dist/` 已加入 Git 忽略规则。

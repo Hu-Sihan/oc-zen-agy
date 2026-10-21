@@ -7,9 +7,10 @@ import { resolve, dirname } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { clientHeaders, tools } from './profile.mjs';
 import { collectCompletion } from './sse.mjs';
+import { loadProxies, createProxyPool, openSocks5 } from './socks5.mjs';
 
 export const defaults = {
-  host: '127.0.0.1', port: 9999, concurrency: 4, stateDir: './state',
+  host: '127.0.0.1', port: 9999, concurrency: 4, stateDir: './state', socks5File: '',
   baseURL: 'https://opencode.ai/inference/openai/v1',
   modelsURL: 'https://opencode.ai/inference/v1/models',
   requestTimeoutMs: 120000, maxBodyBytes: 8 * 1024 * 1024,
@@ -40,6 +41,8 @@ export async function loadConfig(file = 'config.json') {
       throw new Error(`${key} 必须是不含凭证、查询或片段的 HTTP(S) 地址`);
   }
   config.stateDir = resolve(dirname(configFile), config.stateDir);
+  if (typeof config.socks5File !== 'string') throw new Error('socks5File 必须是文件路径字符串或空字符串');
+  if (config.socks5File) config.socks5File = resolve(dirname(configFile), config.socks5File);
   config.apiKey = process.env.ZEN_API_KEY || 'public';
   config.localApiKey = process.env.ZEN_LOCAL_API_KEY || '';
   if (/[\r\n]/.test(config.apiKey + config.localApiKey)) throw new Error('密钥包含非法字符');
@@ -101,8 +104,9 @@ function responseHeaders(headers) {
     || key.startsWith('x-ratelimit-')));
 }
 
-export function createForwarder(config, { sessionIds, log = event => console.log(JSON.stringify(event)) } = {}) {
+export function createForwarder(config, { sessionIds, proxyPool, log = event => console.log(JSON.stringify(event)) } = {}) {
   if (!Array.isArray(sessionIds)) throw new Error('必须在监听之前加载会话列表');
+  if (config.socks5File && !proxyPool) throw new Error('必须在监听之前加载 SOCKS5 号池');
   const pool = Object.freeze([...sessionIds]);
   const agents = {
     'http:': new http.Agent({ keepAlive: true, proxyEnv: {} }),
@@ -128,6 +132,7 @@ export function createForwarder(config, { sessionIds, log = event => console.log
     if (job.node) { job.node.value = null; job.node = null; queued--; }
     job.payload = null;
     job.upstream?.destroy();
+    job.proxySocket?.destroy();
     if (job.running) { active--; job.running = false; }
     jobs.delete(job);
     log({ event: 'complete', trace: job.trace, status: job.response.statusCode, ms: Date.now() - job.started });
@@ -139,6 +144,7 @@ export function createForwarder(config, { sessionIds, log = event => console.log
     const cause = job.aborter.signal.aborted ? job.aborter.signal.reason : error;
     const status = cause?.status || error.status || 502;
     const { request, response } = job;
+    if (!response.headersSent && cause?.retryAfter) response.setHeader('retry-after', String(cause.retryAfter));
     if (!response.headersSent && !request.readableEnded) { response.setHeader('connection', 'close'); request.resume(); }
     if (!response.headersSent && !response.destroyed)
       replyJSON(response, status, { error: { type: cause?.code || error.code || 'proxy_error', message: status === 502 ? '上游请求失败' : cause?.message || error.message } });
@@ -175,15 +181,23 @@ export function createForwarder(config, { sessionIds, log = event => console.log
     }
   }
 
-  function dispatch(job) {
+  async function dispatch(job) {
     try {
+      if (proxyPool) {
+        job.proxy = proxyPool.next();
+        // shortcut: one tunnel per request; add per-proxy keep-alive if setup latency becomes a bottleneck.
+        job.proxySocket = await openSocks5(job.proxy, job.target, job.aborter.signal);
+        if (job.done) { job.proxySocket.destroy(); return; }
+      }
       const protocol = job.target.protocol === 'https:' ? https : http;
       const outgoing = protocol.request(job.target, {
         method: job.chat ? 'POST' : 'GET', headers: job.headers,
-        signal: job.aborter.signal, agent: agents[job.target.protocol],
+        signal: job.aborter.signal,
+        ...(job.proxySocket ? { createConnection: () => job.proxySocket } : { agent: agents[job.target.protocol] }),
       }, async upstream => {
         upstream.on('error', () => {});
         if (job.done) { upstream.destroy(); return; }
+        if (upstream.statusCode === 429 && job.proxy) proxyPool.disable(job.proxy);
         job.upstream = upstream;
         const { response } = job;
         try {
@@ -238,7 +252,8 @@ export function createForwarder(config, { sessionIds, log = event => console.log
       if (stopping) throw fault(503, 'server_closing', '转发服务正在停止');
       const url = new URL(request.url, 'http://localhost');
       if (request.method === 'GET' && url.pathname === '/healthz') {
-        replyJSON(response, 200, { ok: true, mode: 'serve', sessions: pool.length, active, queued, concurrency: config.concurrency });
+        replyJSON(response, 200, { ok: true, mode: 'serve', sessions: pool.length, active, queued, concurrency: config.concurrency,
+          ...(proxyPool ? { proxyPool: proxyPool.status() } : {}) });
         finish(job);
         return;
       }
@@ -305,7 +320,8 @@ export function createForwarder(config, { sessionIds, log = event => console.log
 
 export async function startServers(config, options) {
   const sessionIds = await sessions(config);
-  const forwarder = createForwarder(config, { ...options, sessionIds });
+  const proxyPool = config.socks5File ? createProxyPool(await loadProxies(config.socks5File)) : undefined;
+  const forwarder = createForwarder(config, { ...options, sessionIds, proxyPool });
   const servers = [];
   async function close() {
     forwarder.stop();
